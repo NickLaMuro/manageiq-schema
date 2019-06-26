@@ -28,26 +28,6 @@ describe MoveAwxCredentialsToAuthentications do
       )
     end
 
-    describe "standalone_decrpyt.py" do
-      before do
-        unless AwesomeSpawn.run("python3", :params => [:c => "from django.utils.encoding import smart_str, smart_bytes"]).success?
-          skip "This spec requires python3 and django to be installed"
-        end
-      end
-
-      it "decrypts the things correctly" do
-        stubs = YAML.load_file(data_dir.join("awesome_stubs.yaml"))
-        stubs.each do |h|
-          result = AwesomeSpawn.run(
-            "python3",
-            :params => [script_path],
-            :env    => h[:env]
-          )
-          expect(result.output).to eq(h[:output])
-        end
-      end
-    end
-
     it "doesn't try to migrate authentications without a manager ref" do
       auth = authentication.create!(
         :name => "no_manager_ref",
@@ -213,7 +193,6 @@ describe MoveAwxCredentialsToAuthentications do
         auths.each { |auth| authentication.create!(auth["initial"]) }
 
         stub_awx_credentials(awx_conn)
-        expect_credential_decrypts
 
         migrate
 
@@ -231,18 +210,6 @@ describe MoveAwxCredentialsToAuthentications do
     credentials.each do |cred|
       data = cred["attributes"].to_json
       stub_awx_cred_for_id(connection, cred["id"], [{"inputs" => data}])
-    end
-  end
-
-  def expect_credential_decrypts
-    stubs = YAML.load_file(data_dir.join("awesome_stubs.yaml"))
-    stubs.each do |h|
-      result = AwesomeSpawn::CommandResult.new("python3 #{script_path}", h[:output], "", 0)
-      expect(AwesomeSpawn).to receive(:run).with(
-        "python3",
-        :params => [script_path],
-        :env    => h[:env]
-      ).and_return(result)
     end
   end
 

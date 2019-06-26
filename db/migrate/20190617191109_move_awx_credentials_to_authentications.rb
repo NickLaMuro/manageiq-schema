@@ -5,6 +5,105 @@ class MoveAwxCredentialsToAuthentications < ActiveRecord::Migration[5.0]
     serialize :options
   end
 
+  class Fernet256
+    attr_reader :hmac, :cipher, :signing_key, :encryption_key
+
+    InvalidToken = Class.new(ArgumentError)
+
+    def initialize(key)
+      decoded_key = Base64.urlsafe_decode64(key)
+      if decoded_key.size != 64
+        raise ArgumentError, "Fernet key must be 64 url-safe base64-encoded bytes."
+      end
+
+      @signing_key    = decoded_key[0,32]
+      @encryption_key = decoded_key[32,32]
+
+      @cipher = OpenSSL::Cipher::AES256.new(:CBC)
+      @hmac   = OpenSSL::HMAC.new signing_key, OpenSSL::Digest::SHA256.new
+    end
+
+    def decrypt(token)
+      data = Base64.urlsafe_decode64(token)
+      verify data
+
+      cipher.decrypt
+      cipher.iv  = data[9,16]
+      cipher.key = encryption_key
+      ciphertext = data[25..-33]
+
+      decrypted  = cipher.update ciphertext
+      decrypted << cipher.final
+    end
+
+    private
+
+    def verify(data)
+      hmac << data[0..-33]
+      signature = data[-32..-1]
+      return if hmac.digest == signature
+      raise InvalidToken
+    end
+  end
+
+  class AnsibleDecrypt
+    attr_reader :encryption_key, :encrypted_data
+
+    def self.decrypt(field_name, value, primary_key)
+      require 'openssl'
+      require 'base64'
+
+      return value unless value.include?("$encrypted$")
+
+      new(secret_key, value, field_name, primary_key).decrypt
+    end
+
+    def self.secret_key
+      @secret_key ||= begin
+        key = Authentication.find_by(
+          :resource_id   => MiqDatabase.first.id,
+          :resource_type => "MiqDatabase",
+          :name          => "Ansible Secret Key",
+          :authtype      => "ansible_secret_key",
+          :type          => "AuthToken"
+        ).auth_key
+        ManageIQ::Password.decrypt(key)
+      end
+    end
+
+    def initialize(secret_key, value, field_name, primary_key)
+      @encryption_key = get_encryption_key(secret_key, field_name, primary_key)
+      @encrypted_data = parse_raw_data(value)
+    end
+
+    def decrypt
+      Fernet256.new(encryption_key).decrypt(encrypted_data).chomp
+    end
+
+    private
+
+    def get_encryption_key(secret, field, pk=nil)
+      key_hash  = OpenSSL::Digest::SHA512.new
+      key_hash << secret
+      key_hash << pk if pk
+      key_hash << field
+      Base64.urlsafe_encode64(key_hash.digest)
+    end
+
+    def parse_raw_data(value)
+      raw_data = value[11..-1]
+      raw_data = raw_data[5..-1] if raw_data.start_with?('UTF8$')
+
+      algorithm, base64_data = raw_data.split('$', 2)
+
+      if algorithm != 'AESCBC'
+        raise Fernet256::InvalidToken, "unsupported algorithm: #{algorithm}"
+      end
+
+      Base64.decode64(base64_data)
+    end
+  end
+
   class MiqDatabase < ActiveRecord::Base; end
 
   ENCRYPTED_ATTRIBUTES = %w[
@@ -97,7 +196,7 @@ class MoveAwxCredentialsToAuthentications < ActiveRecord::Migration[5.0]
       end
 
       authentication_attribute = FIELD_MAP[k]
-      decrypted_value          = decrypted_awx_value(k, v, auth.manager_ref)
+      decrypted_value          = AnsibleDecrypt.decrypt(k, v, auth.manager_ref)
       new_value                = ENCRYPTED_ATTRIBUTES.include?(authentication_attribute) ? ManageIQ::Password.encrypt(decrypted_value) : decrypted_value
 
       if authentication_attribute
@@ -110,38 +209,7 @@ class MoveAwxCredentialsToAuthentications < ActiveRecord::Migration[5.0]
     auth.save!
   end
 
-  def decrypted_awx_value(field, value, pk)
-    require 'awesome_spawn'
-
-    return value unless value.include?("$encrypted$")
-
-    env = {
-      "FIELD_NAME"  => field,
-      "VALUE"       => value,
-      "SECRET_KEY"  => secret_key,
-      "PRIMARY_KEY" => pk
-    }
-    result = AwesomeSpawn.run("python3", :params => [script_path], :env => env)
-
-    raise "Failed to decrypt #{field} for credential #{pk}" if result.failure?
-
-    result.output.chomp
-  end
-
   def script_path
     @script_path ||= Pathname.new(__dir__).join("data", File.basename(__FILE__, ".rb")).join("standalone_decrypt.py").to_s
-  end
-
-  def secret_key
-    @secret_key ||= begin
-      key = Authentication.find_by(
-        :resource_id   => MiqDatabase.first.id,
-        :resource_type => "MiqDatabase",
-        :name          => "Ansible Secret Key",
-        :authtype      => "ansible_secret_key",
-        :type          => "AuthToken"
-      ).auth_key
-      ManageIQ::Password.decrypt(key)
-    end
   end
 end
